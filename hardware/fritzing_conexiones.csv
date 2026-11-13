@@ -1,0 +1,28 @@
+Componente,Pin,Conexion,Observacion
+ESP32,GPIO5,RC522 SDA/SS,Conectar al pin SS del lector
+ESP32,GPIO18,RC522 SCK,Clock SPI
+ESP32,GPIO23,RC522 MOSI,Datos del ESP32 al lector
+ESP32,GPIO19,RC522 MISO,Datos del lector al ESP32
+ESP32,GPIO21,RC522 RST,Reset del lector
+ESP32,3.3V,RC522 VCC,Alimentacion de 3.3V
+ESP32,GND,RC522 GND,Tierra comun
+ESP32,GPIO25, LCD I2C SDA,Datos del bus I2C
+ESP32,GPIO26, LCD I2C SCL,Reloj del bus I2C
+ESP32,3.3V, LCD I2C VCC,Alimentacion del modulo LCD
+ESP32,GND, LCD I2C GND,Tierra comun
+ESP32,GPIO13,LED Verde,Pin de salida
+ESP32,GPIO14,LED Rojo,Pin de salida
+ESP32,GPIO27,Buzzer,Salida para sonido
+ESP32,GND,LED Verde Cathode,Resistencia 220 ohm hacia GND
+ESP32,GND,LED Rojo Cathode,Resistencia 220 ohm hacia GND
+ESP32,GND,Buzzer GND,Si el buzzer es pasivo
+ESP32,GPIO13,LED Verde Anodo,Con resistencia 220 ohm
+ESP32,GPIO14,LED Rojo Anodo,Con resistencia 220 ohm
+LCD I2C,SDA,ESP32 GPIO25,Bus I2C
+LCD I2C,SCL,ESP32 GPIO26,Bus I2C
+LCD I2C,VCC,ESP32 3.3V,Segun modulo puede ser 5V
+LCD I2C,GND,ESP32 GND,Tierra comun
+LED Verde,Resistencia 220 ohm,ESP32 GPIO13,Conecta serie al LED
+LED Rojo,Resistencia 220 ohm,ESP32 GPIO14,Conecta serie al LED
+Buzzer,Pin,ESP32 GPIO27,Salida de tono
+Buzzer,GND,ESP32 GND,Si el modulo tiene GND
