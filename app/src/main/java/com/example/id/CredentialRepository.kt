@@ -93,6 +93,89 @@ class CredentialRepository(context: Context) {
             "${CredentialDbHelper.ID} = ?",
             arrayOf(id.toString())
         ) == 1
+
+    fun replaceAll(credentials: List<ManagedCredential>) {
+        val db = database.writableDatabase
+        val normalized = credentials.distinctBy {
+            credentialKey(it.uid, it.type)
+        }.associateBy { credentialKey(it.uid, it.type) }
+        db.beginTransaction()
+        try {
+            val existing = mutableMapOf<String, MutableList<Long>>()
+            db.query(
+                CredentialDbHelper.TABLE,
+                arrayOf(
+                    CredentialDbHelper.ID,
+                    CredentialDbHelper.UID,
+                    CredentialDbHelper.TYPE
+                ),
+                null,
+                null,
+                null,
+                null,
+                "${CredentialDbHelper.ID} DESC"
+            ).use { cursor ->
+                while (cursor.moveToNext()) {
+                    val uid = cursor.getString(cursor.getColumnIndexOrThrow(CredentialDbHelper.UID))
+                    val type = CredentialType.valueOf(
+                        cursor.getString(cursor.getColumnIndexOrThrow(CredentialDbHelper.TYPE))
+                    )
+                    existing.getOrPut(credentialKey(uid, type)) { mutableListOf() } +=
+                        cursor.getLong(cursor.getColumnIndexOrThrow(CredentialDbHelper.ID))
+                }
+            }
+
+            existing.forEach { (key, ids) ->
+                if (key !in normalized) {
+                    ids.forEach { id ->
+                        db.delete(
+                            CredentialDbHelper.TABLE,
+                            "${CredentialDbHelper.ID} = ?",
+                            arrayOf(id.toString())
+                        )
+                    }
+                } else {
+                    ids.drop(1).forEach { id ->
+                        db.delete(
+                            CredentialDbHelper.TABLE,
+                            "${CredentialDbHelper.ID} = ?",
+                            arrayOf(id.toString())
+                        )
+                    }
+                }
+            }
+            normalized.values.forEach { credential ->
+                val key = credentialKey(credential.uid, credential.type)
+                val existingId = existing[key]?.firstOrNull()
+                if (existingId != null) {
+                    db.update(
+                        CredentialDbHelper.TABLE,
+                        ContentValues().apply {
+                            put(CredentialDbHelper.STATUS, credential.status.name)
+                        },
+                        "${CredentialDbHelper.ID} = ?",
+                        arrayOf(existingId.toString())
+                    )
+                } else {
+                    db.insertOrThrow(
+                        CredentialDbHelper.TABLE,
+                        null,
+                        ContentValues().apply {
+                            put(CredentialDbHelper.UID, credential.uid.trim().uppercase())
+                            put(CredentialDbHelper.TYPE, credential.type.name)
+                            put(CredentialDbHelper.STATUS, credential.status.name)
+                        }
+                    )
+                }
+            }
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+        }
+    }
+
+    private fun credentialKey(uid: String, type: CredentialType): String =
+        "${type.name}_${uid.trim().replace(":", "").replace("-", "").uppercase()}"
 }
 
 private class CredentialDbHelper(context: Context) :

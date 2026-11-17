@@ -84,6 +84,10 @@ administradora para registrar ese dispositivo.
 - Consulta del UID asignado y del estado en el lector.
 - Reporte de robo con notificacion push al administrador una vez desplegada la
   funcion.
+- Sincronizacion de UID de tarjetas y tokens entre Firebase y la base local del
+  telefono administrador.
+- Cola persistente de eventos RFID en LittleFS, sincronizada con Firestore
+  cuando la app administradora vuelve a conectarse.
 - Doble confirmacion antes de bloquear o eliminar un UID.
 - Modo de prueba que impide la comunicacion con el ESP32.
 
@@ -91,10 +95,12 @@ administradora para registrar ese dispositivo.
 
 - La comunicacion local entre Android y ESP32 usa HTTP sin TLS. No expongas el
   dispositivo a Internet; utiliza una red privada.
-- Los eventos del firmware se mantienen en memoria y pueden perderse al
-  reiniciar el ESP32.
-- La lista local de credenciales del administrador se guarda en cada telefono;
-  no se sincroniza entre instalaciones.
+- El ESP32 mantiene hasta 500 eventos pendientes en LittleFS y la app los
+  sincroniza con `accessEvents` cuando hay conexion. La lista `managedCredentials`
+  se sincroniza entre telefonos administradores. Ambas colecciones requieren
+  publicar las reglas de `firestore.rules`.
+- No selecciones **Erase All Flash** al actualizar el ESP32: puede borrar los
+  eventos pendientes guardados en LittleFS.
 - No subas `google-services.json`, `.firebaserc`, credenciales de Wi-Fi,
   archivos `.env` ni claves privadas al repositorio.
 - Este prototipo es academico y no es una certificacion de ISO 27400 ni un

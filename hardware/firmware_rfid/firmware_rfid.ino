@@ -19,6 +19,7 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Preferences.h>
+#include <LittleFS.h>
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 #include <time.h>
@@ -51,10 +52,16 @@ Preferences preferencias;
 LiquidCrystal_I2C pantalla(0x27, 16, 2);
 bool pantallaDisponible = false;
 const byte MAX_EVENTOS = 20;
-// Historial circular compartido por los telefonos; solo vive en RAM hasta reiniciar el ESP32.
+// Historial circular reciente para mostrar en el telefono sin esperar Firebase.
 String historial[MAX_EVENTOS];
 byte siguienteEvento = 0;
 byte cantidadEventos = 0;
+const unsigned int MAX_EVENTOS_PENDIENTES = 500;
+const char* ARCHIVO_EVENTOS = "/eventos.log";
+const char* ARCHIVO_EVENTOS_TEMP = "/eventos.tmp";
+const char* ARCHIVO_EVENTOS_RESPALDO = "/eventos.bak";
+bool almacenamientoEventosDisponible = false;
+String idDispositivo;
 
 // Resultado posible de la clasificacion de una credencial RFID.
 enum TipoCredencial {
@@ -106,13 +113,90 @@ String horaActual() {
   return String(texto);
 }
 
-// Inserta el evento mas reciente y reemplaza el mas antiguo al llenar el historial.
+bool guardarEventoPendiente(const String& evento) {
+  if (!almacenamientoEventosDisponible) {
+    Serial.println("ERROR: no se pudo montar LittleFS; evento no persistido.");
+    return false;
+  }
+
+  unsigned int cantidadPendiente = 0;
+  if (LittleFS.exists(ARCHIVO_EVENTOS)) {
+    File lectura = LittleFS.open(ARCHIVO_EVENTOS, FILE_READ);
+    if (!lectura) {
+      Serial.println("ERROR: no se pudo leer la cola persistente de eventos.");
+      return false;
+    }
+    while (lectura.available()) {
+      lectura.readStringUntil('\n');
+      cantidadPendiente++;
+    }
+    lectura.close();
+  }
+
+  if (cantidadPendiente >= MAX_EVENTOS_PENDIENTES) {
+    Serial.println("ERROR: cola persistente llena; sincroniza la app antes de registrar mas eventos.");
+    return false;
+  }
+
+  uint32_t secuencia = preferencias.getUInt("eventSeq", 0) + 1;
+  if (preferencias.putUInt("eventSeq", secuencia) == 0) {
+    Serial.println("ERROR: no se pudo reservar el identificador persistente del evento.");
+    return false;
+  }
+
+  String eventoId = idDispositivo + "-" + String(secuencia);
+  File archivo = LittleFS.open(ARCHIVO_EVENTOS, FILE_APPEND);
+  if (!archivo) {
+    Serial.println("ERROR: no se pudo abrir la cola persistente de eventos.");
+    return false;
+  }
+  size_t escrito = archivo.println(eventoId + "|" + evento);
+  archivo.close();
+  if (escrito == 0) {
+    Serial.println("ERROR: no se pudo escribir el evento en LittleFS.");
+    return false;
+  }
+  return true;
+}
+
+void prepararAlmacenamientoEventos() {
+  bool yaInicializado = preferencias.getBool("eventsFsReady", false);
+  bool montado = LittleFS.begin(false);
+  if (!montado && !yaInicializado) {
+    montado = LittleFS.begin(true);
+  }
+  if (!montado) {
+    Serial.println("ERROR: no se pudo montar LittleFS; el historial no sera durable.");
+    return;
+  }
+  if (!yaInicializado) {
+    preferencias.putBool("eventsFsReady", true);
+  }
+
+  if (!LittleFS.exists(ARCHIVO_EVENTOS) && LittleFS.exists(ARCHIVO_EVENTOS_RESPALDO)) {
+    LittleFS.rename(ARCHIVO_EVENTOS_RESPALDO, ARCHIVO_EVENTOS);
+  } else if (LittleFS.exists(ARCHIVO_EVENTOS) && LittleFS.exists(ARCHIVO_EVENTOS_RESPALDO)) {
+    LittleFS.remove(ARCHIVO_EVENTOS_RESPALDO);
+  }
+  if (LittleFS.exists(ARCHIVO_EVENTOS_TEMP)) {
+    LittleFS.remove(ARCHIVO_EVENTOS_TEMP);
+  }
+
+  idDispositivo = WiFi.macAddress();
+  idDispositivo.replace(":", "");
+  idDispositivo.toUpperCase();
+  almacenamientoEventosDisponible = true;
+}
+
+// Inserta el evento mas reciente en RAM y lo conserva en LittleFS hasta sincronizarlo.
 void registrarEvento(const String& uid, const String& estado, const String& tipo) {
-  historial[siguienteEvento] = horaActual() + "|" + uid + "|" + estado + "|" + tipo;
+  String evento = horaActual() + "|" + uid + "|" + estado + "|" + tipo;
+  historial[siguienteEvento] = evento;
   siguienteEvento = (siguienteEvento + 1) % MAX_EVENTOS;
   if (cantidadEventos < MAX_EVENTOS) {
     cantidadEventos++;
   }
+  guardarEventoPendiente(evento);
 }
 
 // Carga desde Preferences los UID configurados anteriormente.
@@ -147,12 +231,12 @@ void configurarUID() {
   if (tipo == "tarjeta") {
     if (estado == "permitida") {
       if (uid.equalsIgnoreCase(uidTokenBloqueado)) {
-        servidor.send(409, "text/plain", "Ese UID ya esta configurado como token bloqueado");
-        return;
+        uidTokenBloqueado = "";
+        preferencias.putString("token", uidTokenBloqueado);
       }
       uidTarjetaPermitida = uid;
       preferencias.putString("tarjeta", uidTarjetaPermitida);
-      servidor.send(200, "text/plain", "UID de tarjeta permitido actualizado: " + uidTarjetaPermitida);
+      servidor.send(200, "text/plain", "UID autorizado: " + uidTarjetaPermitida);
     } else if (estado == "bloqueada") {
       if (!uid.equalsIgnoreCase(uidTarjetaPermitida)) {
         servidor.send(409, "text/plain", "La tarjeta no es la autorizada actualmente");
@@ -231,6 +315,142 @@ void responderEventos() {
     respuesta += historial[posicion] + "\n";
   }
   servidor.send(200, "text/plain; charset=utf-8", respuesta);
+}
+
+bool secuenciaDeEvento(const String& linea, uint32_t& secuencia) {
+  int separador = linea.indexOf('|');
+  if (separador <= 0) {
+    return false;
+  }
+
+  String prefijo = idDispositivo + "-";
+  String eventoId = linea.substring(0, separador);
+  if (!eventoId.startsWith(prefijo)) {
+    return false;
+  }
+
+  String textoSecuencia = eventoId.substring(prefijo.length());
+  if (textoSecuencia.isEmpty()) {
+    return false;
+  }
+  for (unsigned int indice = 0; indice < textoSecuencia.length(); indice++) {
+    if (!isDigit(textoSecuencia.charAt(indice))) {
+      return false;
+    }
+  }
+
+  secuencia = static_cast<uint32_t>(textoSecuencia.toInt());
+  return secuencia > 0;
+}
+
+void responderEventosPendientes() {
+  if (!almacenamientoEventosDisponible) {
+    servidor.send(503, "text/plain", "El almacenamiento persistente no esta disponible");
+    return;
+  }
+  if (!LittleFS.exists(ARCHIVO_EVENTOS)) {
+    servidor.send(200, "text/plain; charset=utf-8", "");
+    return;
+  }
+
+  File archivo = LittleFS.open(ARCHIVO_EVENTOS, FILE_READ);
+  if (!archivo) {
+    servidor.send(500, "text/plain", "No se pudo leer el historial pendiente");
+    return;
+  }
+  servidor.streamFile(archivo, "text/plain; charset=utf-8");
+  archivo.close();
+}
+
+bool confirmarEventosHasta(uint32_t hasta) {
+  if (!LittleFS.exists(ARCHIVO_EVENTOS)) {
+    return true;
+  }
+
+  File entrada = LittleFS.open(ARCHIVO_EVENTOS, FILE_READ);
+  File temporal = LittleFS.open(ARCHIVO_EVENTOS_TEMP, FILE_WRITE);
+  if (!entrada || !temporal) {
+    if (entrada) entrada.close();
+    if (temporal) temporal.close();
+    LittleFS.remove(ARCHIVO_EVENTOS_TEMP);
+    return false;
+  }
+
+  bool huboEventosConfirmados = false;
+  bool escrituraCorrecta = true;
+  while (entrada.available()) {
+    String linea = entrada.readStringUntil('\n');
+    linea.trim();
+    if (linea.isEmpty()) {
+      continue;
+    }
+
+    uint32_t secuencia = 0;
+    if (secuenciaDeEvento(linea, secuencia) && secuencia <= hasta) {
+      huboEventosConfirmados = true;
+      continue;
+    }
+    if (temporal.println(linea) == 0) {
+      escrituraCorrecta = false;
+      break;
+    }
+  }
+  entrada.close();
+  temporal.close();
+
+  if (!escrituraCorrecta) {
+    LittleFS.remove(ARCHIVO_EVENTOS_TEMP);
+    return false;
+  }
+  if (!huboEventosConfirmados) {
+    LittleFS.remove(ARCHIVO_EVENTOS_TEMP);
+    return true;
+  }
+
+  if (LittleFS.exists(ARCHIVO_EVENTOS_RESPALDO)) {
+    LittleFS.remove(ARCHIVO_EVENTOS_RESPALDO);
+  }
+  if (!LittleFS.rename(ARCHIVO_EVENTOS, ARCHIVO_EVENTOS_RESPALDO)) {
+    LittleFS.remove(ARCHIVO_EVENTOS_TEMP);
+    return false;
+  }
+  if (!LittleFS.rename(ARCHIVO_EVENTOS_TEMP, ARCHIVO_EVENTOS)) {
+    LittleFS.rename(ARCHIVO_EVENTOS_RESPALDO, ARCHIVO_EVENTOS);
+    LittleFS.remove(ARCHIVO_EVENTOS_TEMP);
+    return false;
+  }
+  LittleFS.remove(ARCHIVO_EVENTOS_RESPALDO);
+  return true;
+}
+
+void confirmarEventos() {
+  if (!almacenamientoEventosDisponible) {
+    servidor.send(503, "text/plain", "El almacenamiento persistente no esta disponible");
+    return;
+  }
+  if (!servidor.hasArg("hasta")) {
+    servidor.send(400, "text/plain", "Falta el identificador de secuencia hasta");
+    return;
+  }
+
+  String textoSecuencia = servidor.arg("hasta");
+  if (textoSecuencia.isEmpty()) {
+    servidor.send(400, "text/plain", "La secuencia no es valida");
+    return;
+  }
+  for (unsigned int indice = 0; indice < textoSecuencia.length(); indice++) {
+    if (!isDigit(textoSecuencia.charAt(indice))) {
+      servidor.send(400, "text/plain", "La secuencia no es valida");
+      return;
+    }
+  }
+
+  uint32_t hasta = static_cast<uint32_t>(textoSecuencia.toInt());
+  if (hasta == 0 || !confirmarEventosHasta(hasta)) {
+    servidor.send(500, "text/plain", "No se pudo confirmar el historial sincronizado");
+    return;
+  }
+  servidor.send(200, "text/plain", "Eventos confirmados");
 }
 
 // Responde la consulta de acceso para el UID enviado por la aplicacion.
@@ -380,6 +600,7 @@ void diagnosticarRC522() {
 void conectarWiFi() {
   // Usa una red Wi-Fi existente; el ESP32 no crea un punto de acceso.
   WiFi.mode(WIFI_STA);
+  prepararAlmacenamientoEventos();
   WiFi.begin(NOMBRE_WIFI, CLAVE_WIFI);
   Serial.print("Conectando a WiFi");
 
@@ -401,6 +622,8 @@ void conectarWiFi() {
     servidor.on("/configurar", HTTP_POST, configurarUID); // Actualizacion de un UID.
     servidor.on("/verificar", HTTP_GET, verificarUID);
     servidor.on("/eventos", HTTP_GET, responderEventos);
+    servidor.on("/eventosPendientes", HTTP_GET, responderEventosPendientes);
+    servidor.on("/eventos/confirmar", HTTP_POST, confirmarEventos);
     servidor.on("/alerta", HTTP_POST, recibirAlerta);
     servidor.begin();
     Serial.println("Servidor WiFi iniciado");

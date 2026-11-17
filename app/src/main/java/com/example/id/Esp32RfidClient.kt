@@ -9,7 +9,8 @@ data class AccessEvent(
     val timestamp: String,
     val uid: String,
     val status: String,
-    val type: String
+    val type: String,
+    val eventId: String = ""
 )
 
 // Evita iniciar una solicitud si el modo de prueba esta activo, incluso si cambia
@@ -26,11 +27,29 @@ internal fun parseAccessEvents(response: String): List<AccessEvent> =
     response.lineSequence()
         .filter { it.isNotBlank() }
         .map { line ->
-            val fields = line.split('|')
+            val fields = line.trimEnd('\r').split('|')
             if (fields.size != 4) {
                 throw IOException("El ESP32 devolvió un evento con formato inválido")
             }
             AccessEvent(fields[0], fields[1], fields[2], fields[3])
+        }
+        .toList()
+
+internal fun parsePendingAccessEvents(response: String): List<AccessEvent> =
+    response.lineSequence()
+        .filter { it.isNotBlank() }
+        .map { line ->
+            val fields = line.trimEnd('\r').split('|')
+            if (fields.size != 5 || fields[0].isBlank()) {
+                throw IOException("El ESP32 devolvió un evento pendiente con formato inválido")
+            }
+            AccessEvent(
+                timestamp = fields[1],
+                uid = fields[2],
+                status = fields[3],
+                type = fields[4],
+                eventId = fields[0]
+            )
         }
         .toList()
 
@@ -58,8 +77,20 @@ class Esp32RfidClient(
     /** Comprueba que el firmware responde en GET /estado. */
     fun getStatus(): String = get("/estado")
 
-    /** Lee los eventos recientes compartidos que el ESP32 conserva mientras esta encendido. */
+    /** Lee los 20 eventos recientes que el ESP32 conserva en RAM para la pantalla. */
     fun getEvents(): List<AccessEvent> = parseAccessEvents(get("/eventos"))
+
+    /** Lee los eventos durables pendientes de sincronización con Firebase. */
+    fun getPendingEvents(): List<AccessEvent> =
+        parsePendingAccessEvents(get("/eventosPendientes"))
+
+    /** Confirma en el ESP32 los eventos almacenados en Firebase hasta esta secuencia. */
+    fun confirmEventsThrough(eventId: String): String {
+        val sequence = eventId.substringAfterLast('-', "").toLongOrNull()
+            ?: throw IllegalArgumentException("El identificador del evento no tiene una secuencia válida.")
+        require(sequence > 0) { "La secuencia del evento debe ser mayor que cero." }
+        return postForm("/eventos/confirmar", mapOf("hasta" to sequence.toString()))
+    }
 
     /** Consulta en GET /verificar si un UID tiene acceso autorizado. */
     fun checkUid(uid: String): String =

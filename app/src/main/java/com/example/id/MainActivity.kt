@@ -46,6 +46,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -93,6 +94,81 @@ private enum class DashboardTab(val label: String) {
 private enum class CredentialAction {
     BLOCK,
     DELETE
+}
+
+internal fun isUnregisteredDeniedEvent(
+    event: AccessEvent,
+    registeredCredentials: List<ManagedCredential>
+): Boolean {
+    if (event.type != "ACCESO" || event.status != "DENEGADO") return false
+    val eventUid = normalizeUidForLookup(event.uid)
+    return registeredCredentials.none { normalizeUidForLookup(it.uid) == eventUid }
+}
+
+private fun normalizeUidForLookup(uid: String): String =
+    uid.trim().replace(":", "").replace("-", "").uppercase()
+
+private fun accessEventKey(event: AccessEvent): String =
+    "${event.timestamp}|${normalizeUidForLookup(event.uid)}|${event.status}|${event.type}"
+
+internal data class DeviceEventSyncResult(
+    val recentEvents: List<AccessEvent>,
+    val pendingSyncError: String?
+)
+
+internal data class AccessHistoryRefreshResult(
+    val deviceEvents: List<AccessEvent>?,
+    val firebaseEvents: List<AccessEvent>?,
+    val deviceError: String?,
+    val firebaseError: String?
+)
+
+internal suspend fun refreshAccessHistory(
+    deviceUrl: String,
+    isTestMode: () -> Boolean,
+    eventRepository: AccessEventRepository
+): AccessHistoryRefreshResult {
+    val deviceResponse = runCatching {
+        withContext(Dispatchers.IO) {
+            val client = Esp32RfidClient(deviceUrl)
+            val recentEvents = runEsp32OnlyOutsideTestMode(isTestMode) {
+                client.getEvents()
+            }
+            val pendingSyncError = try {
+                val pendingEvents = runEsp32OnlyOutsideTestMode(isTestMode) {
+                    client.getPendingEvents()
+                }
+                check(!isTestMode()) {
+                    "La conexión con el ESP32 está desactivada en modo de prueba."
+                }
+                eventRepository.savePendingEvents(pendingEvents)
+                pendingEvents.lastOrNull()?.let { event ->
+                    runEsp32OnlyOutsideTestMode(isTestMode) {
+                        client.confirmEventsThrough(event.eventId)
+                    }
+                }
+                null
+            } catch (error: Exception) {
+                error.localizedMessage ?: "No se pudieron sincronizar los eventos pendientes."
+            }
+            DeviceEventSyncResult(recentEvents, pendingSyncError)
+        }
+    }
+
+    val firebaseResponse = runCatching {
+        withContext(Dispatchers.IO) {
+            eventRepository.getRecentEvents()
+        }
+    }
+
+    val deviceResult = deviceResponse.getOrNull()
+    return AccessHistoryRefreshResult(
+        deviceEvents = deviceResult?.recentEvents,
+        firebaseEvents = firebaseResponse.getOrNull(),
+        deviceError = deviceResponse.exceptionOrNull()?.localizedMessage
+            ?: deviceResult?.pendingSyncError,
+        firebaseError = firebaseResponse.exceptionOrNull()?.localizedMessage
+    )
 }
 
 @Composable
@@ -400,6 +476,8 @@ fun DashboardScreen(
     onLogout: () -> Unit
 ) {
     val context = LocalContext.current
+    val accessEventRepository = remember { AccessEventRepository() }
+    val firebaseCredentialRepository = remember { FirebaseCredentialRepository() }
     val settings = remember(context) {
         context.getSharedPreferences("app_settings", android.content.Context.MODE_PRIVATE).also { prefs ->
             if (!prefs.getBoolean("default_emergency_contacts_initialized", false)) {
@@ -445,7 +523,15 @@ fun DashboardScreen(
     var processedNotificationId by remember { mutableStateOf<String?>(null) }
     var credentialsMessage by remember { mutableStateOf("") }
     var sharedEvents by remember { mutableStateOf(emptyList<AccessEvent>()) }
-    var sharedMessage by remember { mutableStateOf("Conecta el ESP32 para consultar el historial compartido.") }
+    var sharedMessage by remember {
+        mutableStateOf("El historial se sincroniza con Firebase al conectar el ESP32.")
+    }
+    var unregisteredEvents by remember { mutableStateOf(emptyList<AccessEvent>()) }
+    var confirmingUnknownUidAddition by remember { mutableStateOf(false) }
+    var unknownUidActionMessage by remember { mutableStateOf("") }
+    var isProcessingUnknownUid by remember { mutableStateOf(false) }
+    var hasInitialEventSnapshot by remember { mutableStateOf(false) }
+    var observedEventKeys by remember { mutableStateOf(emptySet<String>()) }
     var uidCheckMessage by remember { mutableStateOf("") }
     var assignedCardUid by remember { mutableStateOf("") }
     var users by remember { mutableStateOf(emptyList<FirebaseUserProfile>()) }
@@ -463,7 +549,135 @@ fun DashboardScreen(
     var supportPhone by remember {
         mutableStateOf(settings.getString("support_phone", "") ?: "")
     }
+    val latestCredentials by rememberUpdatedState(credentials)
+    val latestUnregisteredEvents by rememberUpdatedState(unregisteredEvents)
     val scope = rememberCoroutineScope()
+    val saveCredentialInFirebase: (ManagedCredential) -> Unit = { credential ->
+        credentialsMessage = "UID guardada localmente; sincronizando con Firebase..."
+        scope.launch {
+            try {
+                withContext(Dispatchers.IO) {
+                    firebaseCredentialRepository.save(credential)
+                }
+                credentialsMessage = "UID sincronizada con Firebase."
+            } catch (error: Exception) {
+                credentialsMessage = "UID guardada en este teléfono, pero Firebase no confirmó " +
+                    "la sincronización: ${error.localizedMessage ?: "error"}"
+            }
+        }
+    }
+    val deleteCredentialFromFirebase: (ManagedCredential) -> Unit = { credential ->
+        scope.launch {
+            try {
+                withContext(Dispatchers.IO) {
+                    firebaseCredentialRepository.delete(credential)
+                }
+                credentialsMessage = "UID eliminada de Firebase."
+            } catch (error: Exception) {
+                credentialsMessage = "UID eliminada localmente, pero Firebase no confirmó " +
+                    "la eliminación: ${error.localizedMessage ?: "error"}"
+            }
+        }
+    }
+    val updateHistoryDisplay: (AccessHistoryRefreshResult) -> Unit = { result ->
+        when {
+            result.firebaseEvents != null -> {
+                sharedEvents = result.firebaseEvents
+                sharedMessage = when {
+                    result.deviceEvents == null ->
+                        "Mostrando el historial de Firebase; ESP32 desconectado."
+                    result.deviceError != null ->
+                        "Eventos pendientes de sincronizar: ${result.deviceError}"
+                    result.firebaseEvents.isEmpty() ->
+                        "Aún no hay eventos registrados en Firebase."
+                    else -> "Historial sincronizado con Firebase."
+                }
+            }
+            result.deviceEvents != null -> {
+                sharedEvents = result.deviceEvents
+                sharedMessage =
+                    "Firebase no disponible: ${result.firebaseError ?: "error"}. " +
+                        "Se muestran los eventos recientes del ESP32."
+            }
+            else -> {
+                sharedMessage = "No se pudo actualizar el historial. " +
+                    "ESP32: ${result.deviceError ?: "sin conexión"}; " +
+                    "Firebase: ${result.firebaseError ?: "sin conexión"}."
+            }
+        }
+    }
+    val processUnknownUid: (AccessEvent, Boolean) -> Unit = { event, block ->
+        if (!isProcessingUnknownUid) {
+            isProcessingUnknownUid = true
+            unknownUidActionMessage = ""
+            scope.launch {
+                val response = runCatching {
+                    withContext(Dispatchers.IO) {
+                        runEsp32OnlyOutsideTestMode(
+                            isTestMode = { settings.getBoolean("demo_mode", true) }
+                        ) {
+                            val client = Esp32RfidClient(deviceUrl)
+                            if (block) {
+                                client.setBlockedTokenUid(event.uid)
+                            } else {
+                                client.setAllowedCardUid(event.uid)
+                            }
+                        }
+                    }
+                }
+
+                response.onSuccess {
+                    val type = if (block) CredentialType.TOKEN else CredentialType.CARD
+                    val status = if (block) {
+                        CredentialStatus.UNAUTHORIZED
+                    } else {
+                        CredentialStatus.AUTHORIZED
+                    }
+                    val localSave = runCatching {
+                        withContext(Dispatchers.IO) {
+                            val saved = credentialRepository.add(event.uid, type, status)
+                            saved to credentialRepository.getAll()
+                        }
+                    }
+                    localSave.onSuccess { (saved, updatedCredentials) ->
+                        credentials = updatedCredentials
+                        if (saved) {
+                            deviceStatus = if (block) {
+                                "UID bloqueada en el ESP32."
+                            } else {
+                                "UID añadida y autorizada en el ESP32."
+                            }
+                            credentialsMessage = deviceStatus
+                            saveCredentialInFirebase(
+                                ManagedCredential(
+                                    id = 0,
+                                    uid = event.uid,
+                                    type = type,
+                                    status = status
+                                )
+                            )
+                            val processedUid = normalizeUidForLookup(event.uid)
+                            unregisteredEvents = unregisteredEvents.filterNot {
+                                normalizeUidForLookup(it.uid) == processedUid
+                            }
+                            confirmingUnknownUidAddition = false
+                        } else {
+                            unknownUidActionMessage =
+                                "El ESP32 se actualizó, pero no se pudo guardar el UID en la app."
+                        }
+                    }.onFailure { error ->
+                        unknownUidActionMessage =
+                            "El ESP32 se actualizó, pero no se pudo guardar el UID en la app: " +
+                                (error.message ?: "error")
+                    }
+                }.onFailure {
+                    unknownUidActionMessage =
+                        "No se pudo actualizar el ESP32: ${it.message ?: "error"}"
+                }
+                isProcessingUnknownUid = false
+            }
+        }
+    }
     LaunchedEffect(notificationUid, notificationReportId, credentials) {
         val targetUid = notificationUid?.uppercase() ?: return@LaunchedEffect
         val reportId = notificationReportId ?: targetUid
@@ -482,6 +696,14 @@ fun DashboardScreen(
             )
         ) {
             credentials = credentialRepository.getAll()
+            saveCredentialInFirebase(
+                ManagedCredential(
+                    id = 0,
+                    uid = targetUid,
+                    type = CredentialType.CARD,
+                    status = CredentialStatus.AUTHORIZED
+                )
+            )
         }
     }
     LaunchedEffect(Unit) {
@@ -493,6 +715,23 @@ fun DashboardScreen(
                     error.localizedMessage ?: "error de Firebase"
                 }"
             }
+        }
+    }
+    LaunchedEffect(authRepository.isAdmin()) {
+        if (!authRepository.isAdmin()) return@LaunchedEffect
+
+        while (true) {
+            try {
+                credentials = withContext(Dispatchers.IO) {
+                    firebaseCredentialRepository.synchronize(credentialRepository)
+                }
+                credentialsMessage = "Lista de UID sincronizada con Firebase."
+            } catch (error: Exception) {
+                credentialsMessage = "No se pudo sincronizar la lista de UID: ${
+                    error.localizedMessage ?: "error de Firebase"
+                }"
+            }
+            delay(15_000)
         }
     }
     LaunchedEffect(selectedTab) {
@@ -551,15 +790,11 @@ fun DashboardScreen(
                         runEsp32OnlyOutsideTestMode(
                             isTestMode = { settings.getBoolean("demo_mode", true) }
                         ) {
-                            val client = Esp32RfidClient(deviceUrl)
-                            client.reportAlert(type)
-                            client.getEvents()
+                            Esp32RfidClient(deviceUrl).reportAlert(type)
                         }
                     }
                 }
                 response.onSuccess {
-                    sharedEvents = it
-                    sharedMessage = "Historial compartido actualizado."
                     alertMessage = if (type == "robo") {
                         "Reporte de robo recibido por el ESP32."
                     } else {
@@ -572,36 +807,42 @@ fun DashboardScreen(
         }
     }
 
-    LaunchedEffect(demoMode, deviceUrl, selectedTab) {
-        if (!demoMode && selectedTab in listOf(
-                DashboardTab.HOME,
-                DashboardTab.RECORDS,
-                DashboardTab.ALERTS,
-                DashboardTab.USER_ACCESS
+    LaunchedEffect(demoMode, deviceUrl, authRepository.isAdmin()) {
+        hasInitialEventSnapshot = false
+        observedEventKeys = emptySet()
+        unregisteredEvents = emptyList()
+        confirmingUnknownUidAddition = false
+        unknownUidActionMessage = ""
+        if (demoMode || !authRepository.isAdmin()) return@LaunchedEffect
+
+        while (true) {
+            val result = refreshAccessHistory(
+                deviceUrl,
+                { settings.getBoolean("demo_mode", true) },
+                accessEventRepository
             )
-        ) {
-            while (true) {
-                val response = runCatching {
-                    withContext(Dispatchers.IO) {
-                        runEsp32OnlyOutsideTestMode(
-                            isTestMode = { settings.getBoolean("demo_mode", true) }
-                        ) {
-                            Esp32RfidClient(deviceUrl).getEvents()
-                        }
-                    }
+            updateHistoryDisplay(result)
+            result.deviceEvents?.let { events ->
+                val currentEventKeys = events.map(::accessEventKey).toSet()
+                val newEvents = if (hasInitialEventSnapshot) {
+                    events.filter { accessEventKey(it) !in observedEventKeys }
+                } else {
+                    emptyList()
                 }
-                response.onSuccess {
-                    sharedEvents = it
-                    sharedMessage = if (it.isEmpty()) {
-                        "Aún no hay eventos registrados."
-                    } else {
-                        "Historial compartido actualizado desde el ESP32."
-                    }
-                }.onFailure {
-                    sharedMessage = "No se pudo actualizar el historial: ${it.message ?: "error de conexión"}"
+                observedEventKeys = currentEventKeys
+                hasInitialEventSnapshot = true
+
+                if (authRepository.isAdmin() && newEvents.isNotEmpty()) {
+                    val alreadyQueued =
+                        latestUnregisteredEvents.map(::accessEventKey).toSet()
+                    val newlyUnregistered = newEvents
+                        .asReversed()
+                        .filter { isUnregisteredDeniedEvent(it, latestCredentials) }
+                        .filter { accessEventKey(it) !in alreadyQueued }
+                    unregisteredEvents = latestUnregisteredEvents + newlyUnregistered
                 }
-                delay(5_000)
             }
+            delay(5_000)
         }
     }
 
@@ -694,6 +935,7 @@ fun DashboardScreen(
                                     }
                                 }
                             }
+
                         }
                     )
 
@@ -715,6 +957,14 @@ fun DashboardScreen(
                                 credentialRepository.add(uid, type, status)
                             if (saved) {
                                 credentials = credentialRepository.getAll()
+                                saveCredentialInFirebase(
+                                    ManagedCredential(
+                                        id = 0,
+                                        uid = uid,
+                                        type = type,
+                                        status = status
+                                    )
+                                )
                             }
                             saved
                         },
@@ -764,6 +1014,7 @@ fun DashboardScreen(
                                 if (demoMode) {
                                     if (credentialRepository.updateStatus(credential.id, newStatus)) {
                                         credentials = credentialRepository.getAll()
+                                        saveCredentialInFirebase(credential.copy(status = newStatus))
                                     }
                                     deviceStatus = "Estado actualizado en la simulación local."
                                     credentialsMessage = "El cambio se guardó localmente; el ESP32 no se modificó en modo de prueba."
@@ -785,6 +1036,7 @@ fun DashboardScreen(
                                     if (response.isSuccess) {
                                         if (credentialRepository.updateStatus(credential.id, newStatus)) {
                                             credentials = credentialRepository.getAll()
+                                            saveCredentialInFirebase(credential.copy(status = newStatus))
                                         }
                                         deviceStatus = "Estado de tarjeta actualizado en el ESP32."
                                         credentialsMessage = "UID bloqueado en el ESP32."
@@ -814,7 +1066,6 @@ fun DashboardScreen(
                                             }
                                         }
                                     }
-                                    authRepository.removeCardUid(credential.uid)
                                     if (credentialRepository.delete(credential.id)) {
                                         credentials = credentialRepository.getAll()
                                         usersMessage = if (demoMode) {
@@ -823,6 +1074,16 @@ fun DashboardScreen(
                                             "UID eliminado de la cuenta y de la lista."
                                         }
                                         credentialsMessage = usersMessage
+                                        deleteCredentialFromFirebase(credential)
+                                        try {
+                                            authRepository.removeCardUid(credential.uid)
+                                        } catch (error: Exception) {
+                                            usersMessage =
+                                                "UID eliminado de la lista, pero no se pudo quitar su asignación: ${
+                                                    error.localizedMessage ?: "error"
+                                                }"
+                                            credentialsMessage = usersMessage
+                                        }
                                     }
                                 } catch (error: Exception) {
                                     credentialsMessage = "No se pudo eliminar el UID: ${
@@ -875,21 +1136,13 @@ fun DashboardScreen(
                         demoMode = demoMode,
                         onRefresh = {
                             scope.launch {
-                                val response = runCatching {
-                                    withContext(Dispatchers.IO) {
-                                        runEsp32OnlyOutsideTestMode(
-                                            isTestMode = { settings.getBoolean("demo_mode", true) }
-                                        ) {
-                                            Esp32RfidClient(deviceUrl).getEvents()
-                                        }
-                                    }
-                                }
-                                response.onSuccess {
-                                    sharedEvents = it
-                                    sharedMessage = "Historial compartido actualizado."
-                                }.onFailure {
-                                    sharedMessage = "No se pudo consultar el ESP32: ${it.message ?: "error"}"
-                                }
+                                updateHistoryDisplay(
+                                    refreshAccessHistory(
+                                        deviceUrl,
+                                        { settings.getBoolean("demo_mode", true) },
+                                        accessEventRepository
+                                    )
+                                )
                             }
                         }
                     )
@@ -1036,6 +1289,118 @@ fun DashboardScreen(
             }
         }
     }
+
+    unregisteredEvents.firstOrNull()?.let { event ->
+        UnknownUidDialog(
+            event = event,
+            confirmingAddition = confirmingUnknownUidAddition,
+            processing = isProcessingUnknownUid,
+            message = unknownUidActionMessage,
+            onAdd = {
+                confirmingUnknownUidAddition = true
+                unknownUidActionMessage = ""
+            },
+            onBlock = { processUnknownUid(event, true) },
+            onConfirmAddition = { processUnknownUid(event, false) },
+            onBack = {
+                confirmingUnknownUidAddition = false
+                unknownUidActionMessage = ""
+            },
+            onDismiss = {
+                unregisteredEvents = unregisteredEvents.drop(1)
+                unknownUidActionMessage = ""
+            }
+        )
+    }
+}
+
+@Composable
+private fun UnknownUidDialog(
+    event: AccessEvent,
+    confirmingAddition: Boolean,
+    processing: Boolean,
+    message: String,
+    onAdd: () -> Unit,
+    onBlock: () -> Unit,
+    onConfirmAddition: () -> Unit,
+    onBack: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    if (confirmingAddition) {
+        AlertDialog(
+            onDismissRequest = { if (!processing) onBack() },
+            title = { Text("¿Confirmas añadir esta UID?") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        "Se añadirá ${event.uid} como tarjeta autorizada. El ESP32 solo admite " +
+                            "una tarjeta autorizada, por lo que reemplazará la actual."
+                    )
+                    if (message.isNotBlank()) {
+                        Text(message, color = Red)
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    enabled = !processing,
+                    onClick = onConfirmAddition
+                ) {
+                    Text(if (processing) "Aplicando..." else "Sí, añadir UID")
+                }
+            },
+            dismissButton = {
+                TextButton(
+                    enabled = !processing,
+                    onClick = onBack
+                ) {
+                    Text("Volver")
+                }
+            }
+        )
+    } else {
+        AlertDialog(
+            onDismissRequest = { if (!processing) onDismiss() },
+            title = { Text("UID no registrada") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        "Se detectó ${event.uid} como no autorizada. Puedes añadirla como tarjeta " +
+                            "autorizada o bloquearla como token. El lector conserva una sola " +
+                            "tarjeta autorizada y un solo token bloqueado; cada cambio reemplaza " +
+                            "el UID anterior de ese tipo."
+                    )
+                    if (message.isNotBlank()) {
+                        Text(message, color = Red)
+                    }
+                }
+            },
+            confirmButton = {
+                Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    TextButton(
+                        enabled = !processing,
+                        onClick = onAdd
+                    ) {
+                        Text("Añadir UID")
+                    }
+                    TextButton(
+                        enabled = !processing,
+                        onClick = onBlock
+                    ) {
+                        Text(if (processing) "Aplicando..." else "Bloquear")
+                    }
+                }
+            },
+            dismissButton = {
+                TextButton(
+                    enabled = !processing,
+                    onClick = onDismiss
+                ) {
+                    Text("Ahora no")
+                }
+            }
+        )
+    }
 }
 
 @Composable
@@ -1122,7 +1487,7 @@ private fun SharedEventsScreen(
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
         Text(
-            text = "Historial compartido del ESP32",
+            text = "Historial compartido en Firebase",
             color = Ink,
             style = MaterialTheme.typography.titleMedium,
             fontWeight = FontWeight.SemiBold
@@ -1131,7 +1496,8 @@ private fun SharedEventsScreen(
             text = if (demoMode) {
                 "Desactiva el modo de prueba para ver las lecturas reales del lector."
             } else {
-                "$message El ESP32 conserva hasta 20 eventos mientras está encendido; la hora usa NTP en UTC."
+                "$message El ESP32 conserva hasta 500 eventos pendientes durante desconexiones. " +
+                    "Firebase guarda el historial; se muestran los 200 más recientes. Hora UTC."
             },
             color = MutedInk,
             style = MaterialTheme.typography.bodySmall
@@ -1705,7 +2071,7 @@ private fun CredentialManagementScreen(
             colors = CardDefaults.cardColors(containerColor = Color.White)
         ) {
             Text(
-                text = "Los UID autorizados se administran localmente en este teléfono y la asignación del usuario se guarda en Firestore. El ESP32 conserva una tarjeta autorizada y un token bloqueado; al aplicar otro UID del mismo tipo, se reemplaza el anterior.",
+                text = "Las tarjetas y los tokens se sincronizan con Firebase y se conservan en este teléfono. El ESP32 conserva una tarjeta autorizada y un token bloqueado; al aplicar otro UID del mismo tipo, se reemplaza el anterior.",
                 modifier = Modifier.padding(16.dp),
                 color = MutedInk,
                 style = MaterialTheme.typography.bodySmall
